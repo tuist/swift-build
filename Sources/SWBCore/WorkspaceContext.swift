@@ -313,6 +313,8 @@ public final class WorkspaceContext: Sendable {
 
     public let discoveredCommandLineToolSpecInfoCache: DiscoveredCommandLineToolSpecInfoCache
 
+    let targetBuildGraphCache: TargetBuildGraphCache
+
     public var sdkRegistry: WorkspaceContextSDKRegistry {
         return sdkRegistryCache.getValue(self)
     }
@@ -330,6 +332,7 @@ public final class WorkspaceContext: Sendable {
         self.xcframeworkCache = FileSystemSignatureBasedCache(fs: fs)
         self.macroConfigFileLoader = MacroConfigFileLoader(core: core, fs: fs)
         self.discoveredCommandLineToolSpecInfoCache = DiscoveredCommandLineToolSpecInfoCache(processExecutionCache: processExecutionCache)
+        self.targetBuildGraphCache = TargetBuildGraphCache()
         self._userInfo = .init(nil)
         self._systemInfo = .init(nil)
         self._userPreferences = .init(.default)

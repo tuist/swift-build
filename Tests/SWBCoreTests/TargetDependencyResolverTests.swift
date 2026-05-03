@@ -331,6 +331,56 @@ fileprivate enum TargetPlatformSpecializationMode {
         }
     }
 
+    @Test
+    func targetBuildGraphCacheInvalidatesWhenSettingsInputsChange() async throws {
+        try await withTemporaryDirectory { tmpDir in
+            let core = try await getCore()
+            let workspaceRoot = tmpDir.join("Workspace")
+            let projectRoot = workspaceRoot.join("aProject")
+            let configPath = projectRoot.join("App.xcconfig")
+            let testWorkspace = TestWorkspace("Workspace",
+                sourceRoot: workspaceRoot,
+                projects: [TestProject("aProject",
+                    groupTree: TestGroup("SomeFiles", children: [
+                        TestFile("App.xcconfig"),
+                    ]),
+                    targets: [
+                        TestStandardTarget("anApp", type: .application, buildConfigurations: [
+                            TestBuildConfiguration("Debug", baseConfig: "App.xcconfig"),
+                        ], dependencies: ["aFramework", "excludedFramework"]),
+                        TestStandardTarget("aFramework", type: .framework),
+                        TestStandardTarget("excludedFramework", type: .framework),
+                    ]
+                )]
+            )
+            let workspace = try testWorkspace.load(core)
+            let fs = PseudoFS()
+            let workspaceContext = try await contextForTestData(workspace, core: core, fs: fs, files: [
+                configPath: "EXCLUDED_EXPLICIT_TARGET_DEPENDENCIES = excludedFramework\n",
+            ])
+            let project = workspace.projects[0]
+            let buildParameters = BuildParameters(configuration: "Debug")
+            let appTarget = BuildRequest.BuildTargetInfo(parameters: buildParameters, target: project.targets[0])
+            let buildRequest = BuildRequest(parameters: buildParameters, buildTargets: [appTarget], continueBuildingAfterErrors: true, useParallelTargets: false, useImplicitDependencies: false, useDryRun: false)
+
+            do {
+                let buildRequestContext = BuildRequestContext(workspaceContext: workspaceContext)
+                let delegate = EmptyTargetDependencyResolverDelegate(workspace: workspaceContext.workspace)
+                let buildGraph = await TargetGraphFactory(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, delegate: delegate).graph(type: .dependency)
+                #expect(buildGraph.allTargets.map { $0.target.name } == ["aFramework", "anApp"])
+            }
+
+            try fs.write(configPath, contents: ByteString(encodingAsUTF8: "EXCLUDED_EXPLICIT_TARGET_DEPENDENCIES =\n"))
+
+            do {
+                let buildRequestContext = BuildRequestContext(workspaceContext: workspaceContext)
+                let delegate = EmptyTargetDependencyResolverDelegate(workspace: workspaceContext.workspace)
+                let buildGraph = await TargetGraphFactory(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, delegate: delegate).graph(type: .dependency)
+                #expect(buildGraph.allTargets.map { $0.target.name } == ["aFramework", "excludedFramework", "anApp"])
+            }
+        }
+    }
+
     /// Check the behavior of target-specialization through package product targets.
     @Test(.requireSDKs(.iOS, .watchOS))
     func packageProductBasedSpecialization() async throws {

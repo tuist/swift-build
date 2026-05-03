@@ -17,4 +17,7 @@ public struct Tuning {
 
     /// The TTL for each WorkspaceContext's Settings cache.
     public static let workspaceSettingsCacheTTL = Duration.seconds(60)
+
+    /// The TTL for each WorkspaceContext's target build graph cache.
+    public static let targetBuildGraphCacheTTL = Duration.seconds(60)
 }

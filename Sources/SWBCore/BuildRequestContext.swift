@@ -15,6 +15,11 @@ public import SWBUtil
 public import SWBMacro
 import Foundation
 
+package struct BuildRequestContextFileSignature: Sendable {
+    let paths: [Path]
+    let signature: FilesSignature
+}
+
 /// Encapsulates the context relevant to the work needed to construct a build description for an incoming build request.
 ///
 /// This object manages caches which are relevant to the lifetime of that build request + build description.
@@ -30,6 +35,15 @@ public final class BuildRequestContext: Sendable {
     /// Gets the file signature for the specified set of paths. This is cached for the lifetime of the build request.
     private func filesSignature(for paths: [Path]) -> FilesSignature {
         filesSignatureCache.getOrInsert(paths) { workspaceContext.fs.filesSignature(paths) }
+    }
+
+    package var computedFileSignatures: [BuildRequestContextFileSignature] {
+        var result = [BuildRequestContextFileSignature]()
+        filesSignatureCache.forEach { paths, signature in
+            let value = signature.getValue({ workspaceContext.fs.filesSignature(paths) }, isValid: { _ in true })
+            result.append(BuildRequestContextFileSignature(paths: paths, signature: value))
+        }
+        return result
     }
 
     public var fs: any FSProxy {

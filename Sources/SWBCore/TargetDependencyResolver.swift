@@ -73,7 +73,7 @@ extension ResolvedTargetDependency {
 /// A completely resolved graph of configured targets for use in a build.
 public struct TargetBuildGraph: TargetGraph, Sendable {
     /// The reason for constructing a build graph. Relevant for whether to stop early or continue.
-    public enum Purpose: Sendable {
+    public enum Purpose: Hashable, Sendable {
         case build
         case dependencyGraph
     }
@@ -109,12 +109,33 @@ public struct TargetBuildGraph: TargetGraph, Sendable {
     ///
     /// The result closure guarantees that all targets a target depends on appear in the returned array before that target.  Any detected dependency cycles will be broken.
     public init(workspaceContext: WorkspaceContext, buildRequest: BuildRequest, buildRequestContext: BuildRequestContext, delegate: any TargetDependencyResolverDelegate, purpose: Purpose = .build) async {
+        let cacheKey = TargetBuildGraphCache.Key(workspaceContext: workspaceContext, buildRequest: buildRequest, purpose: purpose)
+        if let cacheKey, let entry = workspaceContext.targetBuildGraphCache.lookup(cacheKey, workspaceContext: workspaceContext) {
+            entry.replayDiagnostics(to: delegate)
+            self.init(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, allTargets: entry.graph.allTargets, targetDependencies: entry.graph.targetDependencies, targetsToLinkedReferencesToProducingTargets: entry.graph.targetsToLinkedReferencesToProducingTargets, dynamicallyBuildingTargets: entry.graph.dynamicallyBuildingTargets)
+            return
+        }
+
+        let recordingDelegate = cacheKey.map { _ in TargetBuildGraphCache.RecordingDelegate(delegate: delegate) }
+        let resolverDelegate = recordingDelegate ?? delegate
         let (allTargets, targetDependencies, targetsToLinkedReferencesToProducingTargets, dynamicallyBuildingTargets) =
         await MacroNamespace.withExpressionInterningEnabled {
             await buildRequestContext.keepAliveSettingsCache {
-                let resolver = TargetDependencyResolver(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, delegate: delegate, purpose: purpose)
+                let resolver = TargetDependencyResolver(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, delegate: resolverDelegate, purpose: purpose)
                 return await resolver.computeGraph()
             }
+        }
+        if let cacheKey, let recordingDelegate, !Task.isCancelled {
+            workspaceContext.targetBuildGraphCache.insert(TargetBuildGraphCache.Entry(
+                graph: TargetBuildGraphCache.Graph(
+                    allTargets: allTargets,
+                    targetDependencies: targetDependencies,
+                    targetsToLinkedReferencesToProducingTargets: targetsToLinkedReferencesToProducingTargets,
+                    dynamicallyBuildingTargets: dynamicallyBuildingTargets
+                ),
+                diagnostics: recordingDelegate.recordedDiagnostics,
+                fileSignatures: buildRequestContext.computedFileSignatures
+            ), for: cacheKey)
         }
         self.init(workspaceContext: workspaceContext, buildRequest: buildRequest, buildRequestContext: buildRequestContext, allTargets: allTargets, targetDependencies: targetDependencies, targetsToLinkedReferencesToProducingTargets: targetsToLinkedReferencesToProducingTargets, dynamicallyBuildingTargets: dynamicallyBuildingTargets)
     }
@@ -245,6 +266,285 @@ extension TargetBuildGraph {
         }
 
         return buildRequest.useParallelTargets
+    }
+}
+
+final class TargetBuildGraphCache: Sendable {
+    struct Graph: Sendable {
+        let allTargets: OrderedSet<ConfiguredTarget>
+        let targetDependencies: [ConfiguredTarget: [ResolvedTargetDependency]]
+        let targetsToLinkedReferencesToProducingTargets: [ConfiguredTarget: [BuildFile.BuildableItem: ResolvedTargetDependency]]
+        let dynamicallyBuildingTargets: Set<Target>
+    }
+
+    enum RecordedDiagnostic: Sendable {
+        case global(Diagnostic)
+        case target(TargetDiagnosticContext, Diagnostic)
+
+        func replay(to delegate: any TargetDependencyResolverDelegate) {
+            switch self {
+            case let .global(diagnostic):
+                delegate.emit(diagnostic)
+            case let .target(context, diagnostic):
+                delegate.emit(context, diagnostic)
+            }
+        }
+    }
+
+    struct Entry: Sendable {
+        let graph: Graph
+        let diagnostics: [RecordedDiagnostic]
+        let fileSignatures: [BuildRequestContextFileSignature]
+
+        func isValid(workspaceContext: WorkspaceContext) -> Bool {
+            for fileSignature in fileSignatures {
+                if workspaceContext.fs.filesSignature(fileSignature.paths) != fileSignature.signature {
+                    return false
+                }
+            }
+            return true
+        }
+
+        func replayDiagnostics(to delegate: any TargetDependencyResolverDelegate) {
+            diagnostics.forEach { $0.replay(to: delegate) }
+        }
+    }
+
+    struct Key: Hashable, Sendable {
+        struct BuildTargetKey: Hashable, Sendable {
+            let parameters: BuildParameters
+            let targetGUID: String
+        }
+
+        enum DependencyScopeKey: Hashable, Sendable {
+            case workspace
+            case buildRequest
+
+            init(_ dependencyScope: DependencyScope) {
+                switch dependencyScope {
+                case .workspace:
+                    self = .workspace
+                case .buildRequest:
+                    self = .buildRequest
+                }
+            }
+        }
+
+        enum BuildTaskStyleKey: Hashable, Sendable {
+            case buildOnly
+            case buildAndRun
+
+            init(_ style: BuildTaskStyle) {
+                switch style {
+                case .buildOnly:
+                    self = .buildOnly
+                case .buildAndRun:
+                    self = .buildAndRun
+                }
+            }
+        }
+
+        enum BuildLocationStyleKey: Hashable, Sendable {
+            case regular
+            case legacy
+
+            init(_ style: BuildLocationStyle) {
+                switch style {
+                case .regular:
+                    self = .regular
+                case .legacy:
+                    self = .legacy
+                }
+            }
+        }
+
+        enum PreviewStyleKey: Hashable, Sendable {
+            case dynamicReplacement
+            case xojit
+
+            init(_ style: PreviewStyle) {
+                switch style {
+                case .dynamicReplacement:
+                    self = .dynamicReplacement
+                case .xojit:
+                    self = .xojit
+                }
+            }
+        }
+
+        enum BuildCommandKey: Hashable, Sendable {
+            case build(style: BuildTaskStyleKey, skipDependencies: Bool)
+            case generateAssemblyCode(buildOnlyTheseFiles: [Path])
+            case generatePreprocessedFile(buildOnlyTheseFiles: [Path])
+            case singleFileBuild(buildOnlyTheseFiles: [Path])
+            case prepareForIndexing(buildOnlyTheseTargetGUIDs: [String]?, enableIndexBuildArena: Bool)
+            case cleanBuildFolder(style: BuildLocationStyleKey)
+            case cleanBuildFolderAndCaches(style: BuildLocationStyleKey)
+            case cleanCaches(style: BuildLocationStyleKey)
+            case preview(style: PreviewStyleKey)
+
+            init(_ command: BuildCommand) {
+                switch command {
+                case let .build(style, skipDependencies):
+                    self = .build(style: BuildTaskStyleKey(style), skipDependencies: skipDependencies)
+                case let .generateAssemblyCode(buildOnlyTheseFiles):
+                    self = .generateAssemblyCode(buildOnlyTheseFiles: buildOnlyTheseFiles)
+                case let .generatePreprocessedFile(buildOnlyTheseFiles):
+                    self = .generatePreprocessedFile(buildOnlyTheseFiles: buildOnlyTheseFiles)
+                case let .singleFileBuild(buildOnlyTheseFiles):
+                    self = .singleFileBuild(buildOnlyTheseFiles: buildOnlyTheseFiles)
+                case let .prepareForIndexing(buildOnlyTheseTargets, enableIndexBuildArena):
+                    self = .prepareForIndexing(buildOnlyTheseTargetGUIDs: buildOnlyTheseTargets?.map(\.guid), enableIndexBuildArena: enableIndexBuildArena)
+                case let .cleanBuildFolder(style):
+                    self = .cleanBuildFolder(style: BuildLocationStyleKey(style))
+                case let .cleanBuildFolderAndCaches(style):
+                    self = .cleanBuildFolderAndCaches(style: BuildLocationStyleKey(style))
+                case let .cleanCaches(style):
+                    self = .cleanCaches(style: BuildLocationStyleKey(style))
+                case let .preview(style):
+                    self = .preview(style: PreviewStyleKey(style))
+                }
+            }
+        }
+
+        struct UserPreferencesKey: Hashable, Sendable {
+            let enableDebugActivityLogs: Bool
+            let enableBuildDebugging: Bool
+            let enableBuildSystemCaching: Bool
+            let activityTextShorteningLevel: Int
+            let usePerConfigurationBuildLocations: Bool?
+            let allowsExternalToolExecution: Bool
+
+            init(_ userPreferences: UserPreferences) {
+                self.enableDebugActivityLogs = userPreferences.enableDebugActivityLogs
+                self.enableBuildDebugging = userPreferences.enableBuildDebugging
+                self.enableBuildSystemCaching = userPreferences.enableBuildSystemCaching
+                self.activityTextShorteningLevel = userPreferences.activityTextShorteningLevel.rawValue
+                self.usePerConfigurationBuildLocations = userPreferences.usePerConfigurationBuildLocations
+                self.allowsExternalToolExecution = userPreferences.allowsExternalToolExecution
+            }
+        }
+
+        let workspaceSignature: String
+        let parameters: BuildParameters
+        let buildTargets: [BuildTargetKey]
+        let dependencyScope: DependencyScopeKey
+        let useImplicitDependencies: Bool
+        let buildCommand: BuildCommandKey
+        let purpose: TargetBuildGraph.Purpose
+        let userInfo: UserInfo?
+        let systemInfo: SystemInfo?
+        let userPreferences: UserPreferencesKey
+        let makeAggregateTargetsTransparentForSpecialization: Bool
+
+        init?(workspaceContext: WorkspaceContext, buildRequest: BuildRequest, purpose: TargetBuildGraph.Purpose) {
+            let userPreferences = workspaceContext.userPreferences
+            guard userPreferences.enableBuildSystemCaching else {
+                return nil
+            }
+
+            self.workspaceSignature = workspaceContext.workspace.signature
+            self.parameters = buildRequest.parameters
+            self.buildTargets = buildRequest.buildTargets.map { BuildTargetKey(parameters: $0.parameters, targetGUID: $0.target.guid) }
+            self.dependencyScope = DependencyScopeKey(buildRequest.dependencyScope)
+            self.useImplicitDependencies = buildRequest.useImplicitDependencies
+            self.buildCommand = BuildCommandKey(buildRequest.buildCommand)
+            self.purpose = purpose
+            self.userInfo = workspaceContext.userInfo
+            self.systemInfo = workspaceContext.systemInfo
+            self.userPreferences = UserPreferencesKey(userPreferences)
+            self.makeAggregateTargetsTransparentForSpecialization = UserDefaults.makeAggregateTargetsTransparentForSpecialization
+        }
+    }
+
+    final class RecordingDelegate: TargetDependencyResolverDelegate {
+        let delegate: any TargetDependencyResolverDelegate
+        private let diagnostics = SWBMutex([RecordedDiagnostic]())
+
+        init(delegate: any TargetDependencyResolverDelegate) {
+            self.delegate = delegate
+        }
+
+        var recordedDiagnostics: [RecordedDiagnostic] {
+            diagnostics.withLock { $0 }
+        }
+
+        var diagnosticContext: DiagnosticContextData {
+            delegate.diagnosticContext
+        }
+
+        var diagnosticsEngine: DiagnosticProducingDelegateProtocolPrivate<DiagnosticsEngine> {
+            delegate.diagnosticsEngine
+        }
+
+        func diagnosticsEngine(for target: ConfiguredTarget?) -> DiagnosticProducingDelegateProtocolPrivate<DiagnosticsEngine> {
+            delegate.diagnosticsEngine(for: target)
+        }
+
+        func emit(_ diagnostic: Diagnostic) {
+            diagnostics.withLock { $0.append(.global(diagnostic)) }
+            delegate.emit(diagnostic)
+        }
+
+        func emit(_ context: TargetDiagnosticContext, _ diagnostic: Diagnostic) {
+            diagnostics.withLock { $0.append(.target(context, diagnostic)) }
+            delegate.emit(context, diagnostic)
+        }
+
+        func note(_ message: String, location: Diagnostic.Location, component: Component) {
+            emit(Diagnostic(behavior: .note, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func warning(_ message: String, location: Diagnostic.Location, component: Component) {
+            emit(Diagnostic(behavior: .warning, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func error(_ message: String, location: Diagnostic.Location, component: Component) {
+            emit(Diagnostic(behavior: .error, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func remark(_ message: String, location: Diagnostic.Location, component: Component) {
+            emit(Diagnostic(behavior: .remark, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func note(_ context: TargetDiagnosticContext, _ message: String, location: Diagnostic.Location, component: Component) {
+            emit(context, Diagnostic(behavior: .note, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func warning(_ context: TargetDiagnosticContext, _ message: String, location: Diagnostic.Location, component: Component, childDiagnostics: [Diagnostic]) {
+            emit(context, Diagnostic(behavior: .warning, location: location, data: DiagnosticData(message, component: component), childDiagnostics: childDiagnostics))
+        }
+
+        func error(_ context: TargetDiagnosticContext, _ message: String, location: Diagnostic.Location, component: Component) {
+            emit(context, Diagnostic(behavior: .error, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func remark(_ context: TargetDiagnosticContext, _ message: String, location: Diagnostic.Location, component: Component) {
+            emit(context, Diagnostic(behavior: .remark, location: location, data: DiagnosticData(message, component: component)))
+        }
+
+        func updateProgress(statusMessage: String, showInLog: Bool) {
+            delegate.updateProgress(statusMessage: statusMessage, showInLog: showInLog)
+        }
+    }
+
+    private let cache = HeavyCache<Key, Entry>(maximumSize: 8, timeToLive: Tuning.targetBuildGraphCacheTTL)
+
+    func lookup(_ key: Key, workspaceContext: WorkspaceContext) -> Entry? {
+        guard let entry = cache[key] else {
+            return nil
+        }
+
+        guard entry.isValid(workspaceContext: workspaceContext) else {
+            cache[key] = nil
+            return nil
+        }
+
+        return entry
+    }
+
+    func insert(_ entry: Entry, for key: Key) {
+        cache[key] = entry
     }
 }
 

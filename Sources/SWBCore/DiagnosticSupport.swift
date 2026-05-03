@@ -138,7 +138,7 @@ public struct DiagnosticContextData: Sendable {
     }
 }
 
-public enum TargetDiagnosticContext {
+public enum TargetDiagnosticContext: Sendable {
     /// Emits a diagnostic in the context of the delegate's target, if the delegate is associated with a target context. If no target context is associated, emits a global diagnostic.
     case `default`
 
